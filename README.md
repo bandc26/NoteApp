@@ -4,6 +4,11 @@ A small grades application used throughout the Computer Security course. Teacher
 record grades and comments for their classes, students read their own grades, and an
 admin manages users and classes.
 
+## Group Members
+- Bian Hongrui (Rae)
+- Zhang Xinyue (Jacinda)
+- Guo Kexin (Katie)
+
 ## Run it
 
 You need Docker with the Compose plugin.
