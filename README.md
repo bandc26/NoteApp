@@ -4,6 +4,10 @@ A small grades application used throughout the Computer Security course. Teacher
 record grades and comments for their classes, students read their own grades, and an
 admin manages users and classes.
 
+## Student
+- Name: Bian Hongrui (Rae)
+- ID: 2023905334
+
 ## Group Members
 - Bian Hongrui (Rae)
 - Zhang Xinyue (Jacinda)
