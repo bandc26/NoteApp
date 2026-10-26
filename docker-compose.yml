@@ -22,9 +22,11 @@ services:
       DB_HOST: db
       DB_NAME: notesapp
       DB_USER: notesapp
+      COMMENT_ENCRYPTION_KEY: ${COMMENT_ENCRYPTION_KEY}
       POSTGRES_PASSWORD: notesapp_pg_pw_2024
       JWT_SECRET: s3cr3t
       SECRET_KEY: dev-session-key
+      HMAC_SECRET: ${HMAC_SECRET}
     ports:
       - "8080:5000"
     depends_on:

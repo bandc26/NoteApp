@@ -1,0 +1,24 @@
+# Example overlay for the HTTPS lab (27 Oct). NOT used yet.
+#
+# Usage once the lab starts:
+#   docker compose -f docker-compose.yml -f docker-compose.https.yml up
+#
+# It slots an nginx reverse proxy in front of the web service and terminates TLS.
+# Until then the app is served over plain HTTP on purpose (flaw #3).
+
+services:
+  web:
+    ports: !reset []
+    expose:
+      - "5000"
+
+  nginx:
+    image: nginx:1.27
+    depends_on:
+      - web
+    ports:
+      - "443:443"
+      - "80:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./nginx/certs:/etc/nginx/certs:ro
