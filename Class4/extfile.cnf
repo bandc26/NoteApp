@@ -1,0 +1,3 @@
+subjectAltName=DNS:notesapp.example
+extendedKeyUsage=serverAuth
+keyUsage=digitalSignature,keyEncipherment
