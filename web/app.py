@@ -12,6 +12,10 @@ import time
 import base64
 import hashlib
 import subprocess
+import logging
+from binascii import Error as BinasciiError
+
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 import psycopg2
 import psycopg2.extras
@@ -21,22 +25,53 @@ from flask import (
 )
 
 # --- Configuration ------------------------------------------------------------
-# All configuration comes from the environment (set in docker-compose.yml).
 DB_HOST = os.environ.get("DB_HOST", "db")
 DB_NAME = os.environ.get("DB_NAME", "notesapp")
 DB_USER = os.environ.get("DB_USER", "notesapp")
 DB_PASSWORD = os.environ.get("POSTGRES_PASSWORD", "notesapp_pg_pw_2024")
 JWT_SECRET = os.environ.get("JWT_SECRET", "s3cr3t")
 SECRET_KEY = os.environ.get("SECRET_KEY", "dev-session-key")
+LOG_FILE = os.environ.get("NOTESAPP_LOG", "/var/log/notesapp/app.log")
+
+
+def parse_key(key_str: str) -> bytes:
+    """Accept a 32-byte key encoded as 64 hex characters or Base64."""
+    if not key_str:
+        raise ValueError("COMMENT_ENCRYPTION_KEY is not set.")
+
+    if len(key_str) == 64:
+        try:
+            key = bytes.fromhex(key_str)
+            if len(key) == 32:
+                return key
+        except ValueError:
+            pass
+
+    try:
+        key = base64.b64decode(key_str, validate=True)
+        if len(key) == 32:
+            return key
+    except (ValueError, BinasciiError):
+        pass
+
+    raise ValueError(
+        "Invalid COMMENT_ENCRYPTION_KEY. Provide a 64-character hex "
+        "string or a Base64 string encoding exactly 32 bytes."
+    )
+
+
+COMMENT_KEY = parse_key(os.environ.get("COMMENT_ENCRYPTION_KEY"))
+aesgcm = AESGCM(COMMENT_KEY)
+PREFIX = "enc:v1:"
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("NotesApp")
 
 app = Flask(__name__)
 app.secret_key = SECRET_KEY
 
-LOG_FILE = os.environ.get("NOTESAPP_LOG", "/var/log/notesapp/app.log")
-
 
 def log(msg):
-    """Very small access log. No rotation, no policy (see flaw #14)."""
     try:
         with open(LOG_FILE, "a") as fh:
             fh.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}\n")
@@ -52,6 +87,112 @@ def get_db():
     )
     conn.autocommit = True
     return conn
+
+
+# --- AES-GCM comment encryption ------------------------------------------------
+def encrypt_comment(plaintext: str) -> str:
+    if not plaintext:
+        return plaintext
+
+    # Never encrypt anything already marked as encrypted/legacy data.
+    # Its format must be recovered separately rather than wrapped again.
+    if plaintext.startswith("enc:"):
+        return plaintext
+
+    nonce = os.urandom(12)
+    ciphertext = aesgcm.encrypt(nonce, plaintext.encode("utf-8"), None)
+    return PREFIX + (nonce + ciphertext).hex()
+
+
+def decrypt_comment(data: str) -> str:
+    if not data:
+        return data
+
+    if not data.startswith(PREFIX):
+        if data.startswith("enc:"):
+            logger.warning("Legacy encrypted comment requires recovery.")
+            return "[LEGACY ENCRYPTED COMMENT - RECOVERY NEEDED]"
+        return data
+
+    try:
+        raw = bytes.fromhex(data[len(PREFIX):])
+        if len(raw) < 28:
+            raise ValueError("Ciphertext too short")
+
+        plaintext = aesgcm.decrypt(raw[:12], raw[12:], None).decode("utf-8")
+        if plaintext.startswith("enc:"):
+            logger.warning("Nested encrypted comment requires recovery.")
+            return "[NESTED ENCRYPTION - RECOVERY NEEDED]"
+        return plaintext
+    except Exception as exc:
+        logger.error("Comment decryption failed: %s", type(exc).__name__)
+        return "[DECRYPTION FAILED]"
+
+
+def migrate_plaintext_comments() -> bool:
+    """Encrypt ordinary plaintext comments; never rewrite prefixed values."""
+    conn = None
+    cur = None
+    lock_acquired = False
+
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT pg_try_advisory_lock(1001) AS locked")
+        lock_acquired = cur.fetchone()["locked"]
+        if not lock_acquired:
+            return False
+
+        cur.execute("""
+            SELECT id, comment
+            FROM notes
+            WHERE comment IS NOT NULL AND TRIM(comment) <> ''
+            ORDER BY id
+        """)
+        notes = cur.fetchall()
+        migrated = 0
+        skipped = 0
+
+        for note in notes:
+            value = note["comment"]
+
+            # Any enc: prefix is treated as protected data, even if malformed.
+            # This avoids destructive re-encryption of unknown/legacy formats.
+            if value.startswith("enc:"):
+                skipped += 1
+                continue
+
+            encrypted = encrypt_comment(value)
+            cur.execute(
+                "UPDATE notes SET comment = %s WHERE id = %s",
+                (encrypted, note["id"]),
+            )
+            migrated += 1
+
+        logger.info(
+            "Migration completed: %s comments encrypted, %s skipped.",
+            migrated, skipped
+        )
+        return True
+    except Exception:
+        logger.exception("Migration failed.")
+        return False
+    finally:
+        if conn is not None:
+            try:
+                if lock_acquired and cur is not None:
+                    cur.execute("SELECT pg_advisory_unlock(1001)")
+            except Exception:
+                logger.exception("Failed to release migration lock.")
+            finally:
+                conn.close()
+
+
+@app.before_request
+def startup_migrations():
+    if not app.config.get("MIGRATIONS_DONE", False):
+        if migrate_plaintext_comments():
+            app.config["MIGRATIONS_DONE"] = True
 
 
 # --- Minimal JWT (deliberately weak) ------------------------------------------
@@ -74,11 +215,7 @@ def make_jwt(payload: dict) -> str:
 
 
 def verify_jwt(token: str):
-    """Decode a JWT. Accepts alg:none (no signature) and HS256 with a short key.
-
-    This is intentionally broken (flaw #4): an attacker can forge any identity
-    by setting "alg":"none", and the HS256 key is trivially guessable.
-    """
+    """Intentionally weak JWT verifier for the teaching exercise."""
     try:
         h_b64, p_b64, sig_b64 = token.split(".")
     except ValueError:
@@ -91,11 +228,12 @@ def verify_jwt(token: str):
 
     alg = header.get("alg", "").lower()
     if alg == "none":
-        # No signature verification at all.
         return payload
     if alg == "hs256":
         signing_input = f"{h_b64}.{p_b64}".encode()
-        expected = _b64url(hmac.new(JWT_SECRET.encode(), signing_input, hashlib.sha256).digest())
+        expected = _b64url(
+            hmac.new(JWT_SECRET.encode(), signing_input, hashlib.sha256).digest()
+        )
         if hmac.compare_digest(expected, sig_b64):
             return payload
         return None
@@ -103,19 +241,21 @@ def verify_jwt(token: str):
 
 
 def current_identity():
-    """Return the acting identity from a Bearer JWT if present, else the session."""
     auth = request.headers.get("Authorization", "")
     if auth.startswith("Bearer "):
         payload = verify_jwt(auth[7:].strip())
         if payload:
             return payload
     if "user_id" in session:
-        return {"user_id": session["user_id"], "username": session.get("username"),
-                "role": session.get("role")}
+        return {
+            "user_id": session["user_id"],
+            "username": session.get("username"),
+            "role": session.get("role"),
+        }
     return None
 
 
-# --- Auth helpers -------------------------------------------------------------
+# --- Auth helpers --------------------------------------------------------------
 def login_required(role=None):
     if "user_id" not in session:
         return False
@@ -144,7 +284,7 @@ def login():
     if request.method == "POST":
         username = request.form.get("username", "")
         password = request.form.get("password", "")
-        # Flaw #8: SQL injection. Query built by string concatenation, no params.
+        # SQL injection is intentionally retained for the class exercise.
         query = (
             "SELECT id, username, role FROM users "
             "WHERE username = '" + username + "' AND password = '" + password + "'"
@@ -155,7 +295,6 @@ def login():
             cur.execute(query)
             row = cur.fetchone()
         except Exception as e:
-            # Keep the raw error visible - helps the SQLi session.
             error = f"Query error: {e}"
             row = None
         conn.close()
@@ -163,9 +302,10 @@ def login():
             session["user_id"] = row["id"]
             session["username"] = row["username"]
             session["role"] = row["role"]
-            # Issue a weak JWT the dashboard uses to call the API.
             session["token"] = make_jwt({
-                "user_id": row["id"], "username": row["username"], "role": row["role"],
+                "user_id": row["id"],
+                "username": row["username"],
+                "role": row["role"],
             })
             log(f"login success user={row['username']} role={row['role']}")
             return redirect(url_for("index"))
@@ -195,6 +335,8 @@ def dashboard():
     )
     notes = cur.fetchall()
     conn.close()
+    for note in notes:
+        note["comment"] = decrypt_comment(note["comment"])
     return render_template("dashboard.html", notes=notes, token=session.get("token"))
 
 
@@ -205,8 +347,6 @@ def api_notes(note_id):
         return jsonify({"error": "unauthorized"}), 401
     conn = get_db()
     cur = conn.cursor()
-    # Flaw #7 (IDOR): the owner of the note is never checked. Any authenticated
-    # caller can read any note id. Flaw #4: `ident` may come from a forged token.
     cur.execute(
         "SELECT n.id, n.student_id, n.class_id, n.grade, n.comment, "
         "u.username AS student, c.name AS class_name "
@@ -219,6 +359,7 @@ def api_notes(note_id):
     if not note:
         return jsonify({"error": "not found"}), 404
     note["grade"] = float(note["grade"]) if note["grade"] is not None else None
+    note["comment"] = decrypt_comment(note["comment"])
     return jsonify(note)
 
 
@@ -228,7 +369,6 @@ def teacher():
         return redirect(url_for("login"))
     conn = get_db()
     cur = conn.cursor()
-    # A teacher sees every class (no owner scoping - broken access control).
     cur.execute("SELECT id, name, teacher_id FROM classes ORDER BY name")
     classes = cur.fetchall()
     cur.execute(
@@ -241,12 +381,13 @@ def teacher():
     cur.execute("SELECT id, username FROM users WHERE role = 'student' ORDER BY username")
     students = cur.fetchall()
     conn.close()
+    for note in notes:
+        note["comment"] = decrypt_comment(note["comment"])
     return render_template("teacher.html", classes=classes, notes=notes, students=students)
 
 
 @app.route("/grades", methods=["POST"])
 def grades():
-    # Flaw #11: no CSRF token checked on this state-changing POST.
     if not login_required("teacher"):
         return redirect(url_for("login"))
     note_id = request.form.get("note_id", "").strip()
@@ -254,18 +395,20 @@ def grades():
     class_id = request.form.get("class_id")
     grade = request.form.get("grade")
     comment = request.form.get("comment", "")
+    encrypted_comment = encrypt_comment(comment)
+
     conn = get_db()
     cur = conn.cursor()
     if note_id:
         cur.execute(
             "UPDATE notes SET grade = %s, comment = %s WHERE id = %s",
-            (grade, comment, note_id),
+            (grade, encrypted_comment, note_id),
         )
     else:
         cur.execute(
             "INSERT INTO notes (student_id, class_id, grade, comment) "
             "VALUES (%s, %s, %s, %s)",
-            (student_id, class_id, grade, comment),
+            (student_id, class_id, grade, encrypted_comment),
         )
     conn.close()
     log(f"grade write by {session.get('username')} note_id={note_id or 'new'}")
@@ -295,15 +438,67 @@ def export_csv():
         )
     rows = cur.fetchall()
     conn.close()
-    buf = io.StringIO()
-    writer = csv.writer(buf)
+
+    buf = io.StringIO(newline="")
+    writer = csv.writer(buf, lineterminator="\n")
     writer.writerow(["student", "class", "grade", "comment"])
-    for r in rows:
-        writer.writerow([r["student"], r["class"], r["grade"], r["comment"]])
+    for row in rows:
+        writer.writerow([
+            row["student"], row["class"], row["grade"],
+            decrypt_comment(row["comment"]),
+        ])
+
+    content = buf.getvalue()
+    secret = os.environ.get("HMAC_SECRET")
+    if not secret:
+        return "HMAC_SECRET is not configured", 500
+    digest = hmac.new(
+        secret.encode("utf-8"), content.encode("utf-8"), hashlib.sha256
+    ).hexdigest()
+    protected_content = content + f"# HMAC-SHA256: {digest}\n"
     return Response(
-        buf.getvalue(), mimetype="text/csv",
+        protected_content,
+        mimetype="text/csv",
         headers={"Content-Disposition": "attachment; filename=grades.csv"},
     )
+
+
+@app.route("/verify.csv", methods=["GET", "POST"])
+def verify_csv():
+    if not login_required("teacher"):
+        return redirect(url_for("login"))
+    if request.method == "GET":
+        return (
+            '<h2>Verify CSV integrity</h2>'
+            '<form method="post" enctype="multipart/form-data">'
+            '<input type="file" name="file" accept=".csv" required>'
+            '<button type="submit">Verify</button></form>'
+        )
+
+    uploaded = request.files.get("file")
+    if not uploaded:
+        return "No file uploaded", 400
+    try:
+        text = uploaded.read().decode("utf-8")
+    except UnicodeDecodeError:
+        return "CHECK FAILED: invalid file encoding", 400
+
+    lines = text.splitlines(keepends=True)
+    if not lines or not lines[-1].startswith("# HMAC-SHA256: "):
+        return "CHECK FAILED: HMAC missing", 400
+
+    supplied = lines[-1].strip().removeprefix("# HMAC-SHA256: ")
+    content = "".join(lines[:-1])
+    secret = os.environ.get("HMAC_SECRET")
+    if not secret:
+        return "HMAC_SECRET is not configured", 500
+
+    expected = hmac.new(
+        secret.encode("utf-8"), content.encode("utf-8"), hashlib.sha256
+    ).hexdigest()
+    if hmac.compare_digest(supplied, expected):
+        return "CHECK PASSED: file integrity verified"
+    return "CHECK FAILED: file has been modified", 400
 
 
 @app.route("/admin")
@@ -317,17 +512,17 @@ def admin():
     cur.execute("SELECT id, name, teacher_id FROM classes ORDER BY id")
     classes = cur.fetchall()
     conn.close()
-    return render_template("admin.html", users=users, classes=classes,
-                           ping_result=request.args.get("ping_result"))
+    return render_template(
+        "admin.html", users=users, classes=classes,
+        ping_result=request.args.get("ping_result"),
+    )
 
 
 @app.route("/admin/ping", methods=["POST"])
 def admin_ping():
-    # Flaw #11: no CSRF token. Flaw #9: command injection via os/system shell.
     if not login_required("admin"):
         return redirect(url_for("login"))
     host = request.form.get("host", "")
-    # Host is concatenated straight into a shell command.
     cmd = "ping -c 1 " + host
     try:
         result = subprocess.run(
@@ -337,8 +532,10 @@ def admin_ping():
     except Exception as e:
         output = str(e)
     log(f"admin ping host={host!r}")
-    return render_template("admin.html", users=_all_users(), classes=_all_classes(),
-                           ping_result=output)
+    return render_template(
+        "admin.html", users=_all_users(), classes=_all_classes(),
+        ping_result=output,
+    )
 
 
 def _all_users():
@@ -370,11 +567,18 @@ def admin_users():
         cur.execute(
             "INSERT INTO users (username, password, role, teacher_id) "
             "VALUES (%s, %s, %s, %s)",
-            (request.form.get("username"), request.form.get("password"),
-             request.form.get("role", "student"), None),
+            (
+                request.form.get("username"),
+                request.form.get("password"),
+                request.form.get("role", "student"),
+                None,
+            ),
         )
     elif action == "delete":
-        cur.execute("DELETE FROM users WHERE id = %s", (request.form.get("user_id"),))
+        cur.execute(
+            "DELETE FROM users WHERE id = %s",
+            (request.form.get("user_id"),),
+        )
     conn.close()
     return redirect(url_for("admin"))
 
@@ -390,5 +594,4 @@ def healthz():
 
 
 if __name__ == "__main__":
-    # Plain HTTP on purpose (flaw #3). Nginx + TLS is added in a later lab.
     app.run(host="0.0.0.0", port=5000, debug=True)
