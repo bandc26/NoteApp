@@ -17,6 +17,10 @@ from binascii import Error as BinasciiError
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
+# --- New: Argon2 imports for password hashing ---
+from argon2 import PasswordHasher
+from argon2.exceptions import VerifyMismatchError, VerificationError, InvalidHashError
+
 import psycopg2
 import psycopg2.extras
 from flask import (
@@ -70,6 +74,9 @@ logger = logging.getLogger("NotesApp")
 app = Flask(__name__)
 app.secret_key = SECRET_KEY
 
+# --- New: Initialize Argon2 hasher ---
+password_hasher = PasswordHasher()
+
 
 def log(msg):
     try:
@@ -93,9 +100,6 @@ def get_db():
 def encrypt_comment(plaintext: str) -> str:
     if not plaintext:
         return plaintext
-
-    # Never encrypt anything already marked as encrypted/legacy data.
-    # Its format must be recovered separately rather than wrapped again.
     if plaintext.startswith("enc:"):
         return plaintext
 
@@ -215,7 +219,7 @@ def make_jwt(payload: dict) -> str:
 
 
 def verify_jwt(token: str):
-    """Intentionally weak JWT verifier for the teaching exercise."""
+
     try:
         h_b64, p_b64, sig_b64 = token.split(".")
     except ValueError:
@@ -286,8 +290,8 @@ def login():
         password = request.form.get("password", "")
         # SQL injection is intentionally retained for the class exercise.
         query = (
-            "SELECT id, username, role FROM users "
-            "WHERE username = '" + username + "' AND password = '" + password + "'"
+            "SELECT id, username, role, password FROM users "
+            "WHERE username = '" + username + "'"
         )
         conn = get_db()
         cur = conn.cursor()
@@ -297,18 +301,44 @@ def login():
         except Exception as e:
             error = f"Query error: {e}"
             row = None
-        conn.close()
+
         if row:
-            session["user_id"] = row["id"]
-            session["username"] = row["username"]
-            session["role"] = row["role"]
-            session["token"] = make_jwt({
-                "user_id": row["id"],
-                "username": row["username"],
-                "role": row["role"],
-            })
-            log(f"login success user={row['username']} role={row['role']}")
-            return redirect(url_for("index"))
+            stored_password = row["password"]
+            password_valid = False
+
+            if stored_password.startswith("$argon2"):
+                # Verify a modern Argon2 password hash.
+                try:
+                    password_hasher.verify(stored_password, password)
+                    password_valid = True
+                except (VerifyMismatchError, VerificationError, InvalidHashError):
+                    password_valid = False
+            else:
+                # Legacy account: upgrade plaintext after successful login.
+                if stored_password == password:
+                    password_valid = True
+                    upgraded_hash = password_hasher.hash(password)
+                    cur.execute(
+                        "UPDATE users SET password = %s WHERE id = %s",
+                        (upgraded_hash, row["id"]),
+                    )
+            
+            conn.close()
+
+            if password_valid:
+                session["user_id"] = row["id"]
+                session["username"] = row["username"]
+                session["role"] = row["role"]
+                session["token"] = make_jwt({
+                    "user_id": row["id"],
+                    "username": row["username"],
+                    "role": row["role"],
+                })
+                log(f"login success user={row['username']} role={row['role']}")
+                return redirect(url_for("index"))
+        else:
+            conn.close()
+
         if not error:
             error = "Invalid credentials."
         log(f"login failure username={username!r}")
@@ -564,15 +594,17 @@ def admin_users():
     conn = get_db()
     cur = conn.cursor()
     if action == "create":
+        username = request.form.get("username")
+        raw_password = request.form.get("password")
+        role = request.form.get("role", "student")
+        
+        # Hash the password before storing it.
+        password_hash = password_hasher.hash(raw_password)
+        
         cur.execute(
             "INSERT INTO users (username, password, role, teacher_id) "
             "VALUES (%s, %s, %s, %s)",
-            (
-                request.form.get("username"),
-                request.form.get("password"),
-                request.form.get("role", "student"),
-                None,
-            ),
+            (username, password_hash, role, None),
         )
     elif action == "delete":
         cur.execute(
